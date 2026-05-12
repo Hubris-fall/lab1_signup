@@ -14,7 +14,7 @@ GROUP_ID  = "5b8a6718b3d6edf7"  # Paste the group_id printed by register.py here
 # All 3 member public keys in the same canonical order used during registration.
 # Index 0 = round-1 submitter, 1 = round-2 submitter, 2 = round-3 submitter.
 MEMBER_KEYS_HEX = [
-    "4c69624e61434c504b3ac8889c9ee8dd9918fe5edb935a0d9af8b5ffd3bc9cdfe9d46acd43ce23aef241016f0c1b5bc96018bb6b5ebc5f898fa54f7e8f34510fcbb6a4b366503a0bf82b",  # member 1 (round-1 submitter)
+    "4c69624e61434c504b3ace00d54dc531c779ea9033c3ed9b81c5cf1dced8e16bb70efa91b195d119f07f7a48aea4e7285e9a8c4b3f14e8cf3ada17a5cd43c69e9479eccdc69c36655a42",  # member 1 (round-1 submitter)
     "4c69624e61434c504b3a5f466412912c28b51bdb36dceadbf8d13513be72e463662a38832e46b9116a5175133644feb6a13ff83ff863ba434c50b68a2cd950a2ec85b9172a713e57e7f4",  # member 2 (round-2 submitter)
     "4c69624e61434c504b3a2a607508759bbf8873496aae443013b136fdcd3e19f5a7ddb2b148df53b75e441cf7c024b1e84d9016e0a697dbe05dd307ab9e7ee1543464fdac2d7bb493ce88",  # member 3 (round-3 submitter)
 ]
@@ -63,6 +63,11 @@ class RoundDonePayload(VariablePayload):
     format_list = ["varlenHutf8", "q"]
     names = ["group_id", "rounds_completed"]
 
+class ReadyPayload(VariablePayload):
+    msg_id = 13
+    format_list = ["varlenHutf8"]
+    names = ["group_id"]
+
 ChallengeRequestPayload  = vp_compile(ChallengeRequestPayload)
 ChallengeResponsePayload = vp_compile(ChallengeResponsePayload)
 SignatureBundlePayload   = vp_compile(SignatureBundlePayload)
@@ -70,6 +75,7 @@ RoundResultPayload       = vp_compile(RoundResultPayload)
 SigSharePayload          = vp_compile(SigSharePayload)
 NonceSharePayload        = vp_compile(NonceSharePayload)
 RoundDonePayload         = vp_compile(RoundDonePayload)
+ReadyPayload             = vp_compile(ReadyPayload)
 
 
 class Lab2Community(Community):
@@ -82,15 +88,18 @@ class Lab2Community(Community):
         self.add_message_handler(SigSharePayload,          self.on_sig_share)
         self.add_message_handler(NonceSharePayload,        self.on_nonce_share)
         self.add_message_handler(RoundDonePayload,         self.on_round_done)
+        self.add_message_handler(ReadyPayload,             self.on_ready)
 
         self.server_peer = None
         self.done        = False
-        self.done_event  = asyncio.Event()  # FIX 5
+        self.done_event  = asyncio.Event()
         self.sigs        = {}   # round_number -> {member_idx: sig_bytes}
         self.nonces      = {}   # round_number -> nonce bytes (submitter only)
         self.pending            = set()  # sent to server, not yet confirmed
         self.submitted          = set()  # confirmed successful rounds
         self.challenge_requested = False  # guard against duplicate on_round_done triggers
+        self.ready_members      = set()  # indices of teammates who confirmed bidirectional visibility
+        self._ready_sent        = False
 
         self._my_hex = ""
         self._my_idx = -1
@@ -121,19 +130,40 @@ class Lab2Community(Community):
             print("Searching for server...")
             return
 
-        missing = [k[:16] + "..." for k in MEMBER_KEYS_HEX
+        missing = [k[-16:] + "..." for k in MEMBER_KEYS_HEX
                    if k != self._my_hex and k not in peers_by_key]
         if missing:
             print(f"Waiting for teammates: {missing}")
             return
 
-        # FIX 3: stop the discovery heartbeat once everyone is visible.
-        # Only the round-1 submitter requests a challenge now; others wait
-        # for a NonceShare from their round's submitter, or a RoundDone signal.
+        # All peers visible — announce ready on every tick until we hear back from all teammates.
+        # This proves bidirectional connectivity before starting the protocol.
+        if not self._ready_sent:
+            self._ready_sent = True
+            print("All peers visible — announcing ready.")
+        for tm in self._teammates():
+            self.ez_send(tm, ReadyPayload(GROUP_ID))
+
+        not_ready = [i + 1 for i, k in enumerate(MEMBER_KEYS_HEX)
+                     if k != self._my_hex and i not in self.ready_members]
+        if not_ready:
+            print(f"Waiting for ready from member(s): {not_ready}")
+            return
+
         self.cancel_pending_task("heartbeat")
-        print("All peers visible — ready.")
+        print("All peers mutually visible — starting protocol.")
         if MY_ROUND == 1:
             self._request_challenge()
+
+    @lazy_wrapper(ReadyPayload)
+    def on_ready(self, peer, payload):
+        sender_hex = peer.public_key.key_to_bin().hex()
+        if sender_hex not in MEMBER_KEYS_HEX or payload.group_id != GROUP_ID:
+            return
+        sender_idx = MEMBER_KEYS_HEX.index(sender_hex)
+        if sender_idx not in self.ready_members:
+            self.ready_members.add(sender_idx)
+            print(f"Member {sender_idx + 1} is ready ({len(self.ready_members)}/2 teammates ready)")
 
     def _request_challenge(self):
         if self.done or self.server_peer is None:
