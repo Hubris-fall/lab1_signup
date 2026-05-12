@@ -52,11 +52,23 @@ class SigSharePayload(VariablePayload):
     format_list = ["varlenHutf8", "q", "varlenH"]
     names = ["group_id", "round_number", "signature"]
 
+class NonceSharePayload(VariablePayload):
+    msg_id = 11
+    format_list = ["varlenHutf8", "q", "varlenH"]
+    names = ["group_id", "round_number", "nonce"]
+
+class RoundDonePayload(VariablePayload):
+    msg_id = 12
+    format_list = ["varlenHutf8", "q"]
+    names = ["group_id", "rounds_completed"]
+
 ChallengeRequestPayload  = vp_compile(ChallengeRequestPayload)
 ChallengeResponsePayload = vp_compile(ChallengeResponsePayload)
 SignatureBundlePayload   = vp_compile(SignatureBundlePayload)
 RoundResultPayload       = vp_compile(RoundResultPayload)
 SigSharePayload          = vp_compile(SigSharePayload)
+NonceSharePayload        = vp_compile(NonceSharePayload)
+RoundDonePayload         = vp_compile(RoundDonePayload)
 
 
 class Lab2Community(Community):
@@ -67,19 +79,32 @@ class Lab2Community(Community):
         self.add_message_handler(ChallengeResponsePayload, self.on_challenge)
         self.add_message_handler(RoundResultPayload,       self.on_round_result)
         self.add_message_handler(SigSharePayload,          self.on_sig_share)
+        self.add_message_handler(NonceSharePayload,        self.on_nonce_share)
+        self.add_message_handler(RoundDonePayload,         self.on_round_done)
 
         self.server_peer = None
         self.done        = False
+        self.done_event  = asyncio.Event()  # FIX 5
         self.sigs        = {}   # round_number -> {member_idx: sig_bytes}
         self.nonces      = {}   # round_number -> nonce bytes (submitter only)
-        self.submitted   = set()
+        self.pending     = set()   # FIX 4: sent to server, not yet confirmed
+        self.submitted   = set()   # FIX 4: confirmed successful rounds
 
         self._my_hex = ""
         self._my_idx = -1
 
-    def started(self, _ipv8):
+    # FIX 1: no _ipv8 parameter — IPv8 calls started() with no args
+    def started(self):
         self._my_hex = self.my_peer.public_key.key_to_bin().hex()
+        if self._my_hex not in MEMBER_KEYS_HEX:
+            raise RuntimeError(f"My key not in MEMBER_KEYS_HEX:\n  {self._my_hex}")
         self._my_idx = MEMBER_KEYS_HEX.index(self._my_hex)
+        # FIX 6: catch misconfigured MY_ROUND immediately
+        if self._my_idx != MY_ROUND - 1:
+            raise RuntimeError(
+                f"MY_ROUND={MY_ROUND} wrong — key is at index {self._my_idx}, "
+                f"set MY_ROUND={self._my_idx + 1}"
+            )
         print(f"My public key : {self._my_hex}")
         print(f"My round      : {MY_ROUND}")
         self.register_task("heartbeat", self._heartbeat, interval=0.5, delay=1.0)
@@ -88,41 +113,63 @@ class Lab2Community(Community):
         if self.done:
             return
 
-        for peer in self.get_peers():
-            if peer.public_key.key_to_bin().hex() == SERVER_KEY_HEX:
-                self.server_peer = peer
-                break
+        peers_by_key = {p.public_key.key_to_bin().hex(): p for p in self.get_peers()}
 
+        self.server_peer = peers_by_key.get(SERVER_KEY_HEX)
         if self.server_peer is None:
             print("Searching for server...")
             return
 
+        missing = [k[:16] + "..." for k in MEMBER_KEYS_HEX
+                   if k != self._my_hex and k not in peers_by_key]
+        if missing:
+            print(f"Waiting for teammates: {missing}")
+            return
+
+        # FIX 3: stop the discovery heartbeat once everyone is visible.
+        # Only the round-1 submitter requests a challenge now; others wait
+        # for a NonceShare from their round's submitter, or a RoundDone signal.
+        self.cancel_pending_task("heartbeat")
+        print("All peers visible — ready.")
+        if MY_ROUND == 1:
+            self._request_challenge()
+
+    def _request_challenge(self):
+        if self.done or self.server_peer is None:
+            return
         self.ez_send(self.server_peer, ChallengeRequestPayload(GROUP_ID))
+        # Retry every second in case the request or response is lost
+        self.register_task("challenge_retry", self._request_challenge, delay=1.0)
 
     @lazy_wrapper(ChallengeResponsePayload)
     def on_challenge(self, peer, payload):
         if peer.public_key.key_to_bin().hex() != SERVER_KEY_HEX:
             return
-
         rn, nonce = payload.round_number, payload.nonce
-        my_sig = self.my_peer.key.signature(nonce)
+        if rn != MY_ROUND or rn in self.nonces:
+            return
 
-        if MY_ROUND == rn:
-            self.nonces.setdefault(rn, nonce)
-            self.sigs.setdefault(rn, {})[self._my_idx] = my_sig
-            self._try_submit(rn)
-        else:
-            submitter_peer = self._peer_by_key(MEMBER_KEYS_HEX[rn - 1])
-            if submitter_peer:
-                self.ez_send(submitter_peer, SigSharePayload(GROUP_ID, rn, my_sig))
-            else:
-                self.register_anonymous_task(
-                    f"retry_sig_{rn}",
-                    lambda r=rn, s=my_sig: self._retry_sig(r, s),
-                    delay=0.3,
-                )
+        self.cancel_pending_task("challenge_retry")
+        self.nonces[rn] = nonce
 
-    def _retry_sig(self, rn, my_sig):
+        # FIX 2: use self.crypto.create_signature — safe for any key type
+        my_sig = self.crypto.create_signature(self.my_peer.key, nonce)
+        self.sigs.setdefault(rn, {})[self._my_idx] = my_sig
+
+        # FIX 3: submitter pushes nonce to teammates so they never need to poll
+        for tm in self._teammates():
+            self.ez_send(tm, NonceSharePayload(GROUP_ID, rn, nonce))
+
+        self._try_submit(rn)
+
+    # FIX 3: non-submitters receive the nonce here instead of polling the server
+    @lazy_wrapper(NonceSharePayload)
+    def on_nonce_share(self, peer, payload):
+        if peer.public_key.key_to_bin().hex() not in MEMBER_KEYS_HEX:
+            return
+        rn, nonce = payload.round_number, payload.nonce
+        # FIX 2
+        my_sig = self.crypto.create_signature(self.my_peer.key, nonce)
         submitter_peer = self._peer_by_key(MEMBER_KEYS_HEX[rn - 1])
         if submitter_peer:
             self.ez_send(submitter_peer, SigSharePayload(GROUP_ID, rn, my_sig))
@@ -136,7 +183,8 @@ class Lab2Community(Community):
         sender_idx = MEMBER_KEYS_HEX.index(sender_hex)
         rn = payload.round_number
 
-        if rn != MY_ROUND or rn in self.submitted:
+        # FIX 4: also block if already pending (sent but not yet confirmed)
+        if rn != MY_ROUND or rn in self.submitted or rn in self.pending:
             return
 
         self.sigs.setdefault(rn, {})[sender_idx] = payload.signature
@@ -144,7 +192,8 @@ class Lab2Community(Community):
         self._try_submit(rn)
 
     def _try_submit(self, rn):
-        if rn != MY_ROUND or rn in self.submitted:
+        # FIX 4: pending means we sent a bundle but haven't heard back yet — don't double-send
+        if rn != MY_ROUND or rn in self.submitted or rn in self.pending:
             return
         nonce = self.nonces.get(rn)
         sigs  = self.sigs.get(rn, {})
@@ -152,7 +201,8 @@ class Lab2Community(Community):
             print(f"[Round {rn}] Have {len(sigs)}/3 sigs — waiting")
             return
 
-        self.submitted.add(rn)
+        # FIX 4: mark pending now; only promote to submitted after server confirms
+        self.pending.add(rn)
         print(f"[Round {rn}] All 3 sigs — submitting bundle!")
         self.ez_send(
             self.server_peer,
@@ -163,27 +213,54 @@ class Lab2Community(Community):
     def on_round_result(self, peer, payload):
         if peer.public_key.key_to_bin().hex() != SERVER_KEY_HEX:
             return
+        rn = payload.round_number
+        print(f"[Round {rn}] success={payload.success} | {payload.message}")
 
-        print(f"[Round {payload.round_number}] success={payload.success} | {payload.message}")
+        if payload.success:
+            # FIX 4: confirm only after server says so
+            self.pending.discard(rn)
+            self.submitted.add(rn)
 
-        if payload.success and payload.rounds_completed >= 3:
-            self.done = True
-            print("All 3 rounds complete!")
-            asyncio.get_event_loop().stop()
-            return
+            if payload.rounds_completed >= 3:
+                self.done = True
+                print("All 3 rounds complete!")
+                self.done_event.set()  # FIX 5
+                return
 
-        if "already completed" in payload.message:
-            self.done = True
-            asyncio.get_event_loop().stop()
-            return
-
-        if not payload.success and payload.round_number == MY_ROUND:
+            # FIX 3: signal next submitter (3 attempts to survive packet loss)
+            next_peer = self._peer_by_key(MEMBER_KEYS_HEX[payload.rounds_completed])
+            if next_peer:
+                for delay in (0.0, 0.2, 0.5):
+                    self.register_anonymous_task(
+                        f"notify_{delay}",
+                        lambda p=next_peer, rc=payload.rounds_completed:
+                            self.ez_send(p, RoundDonePayload(GROUP_ID, rc)),
+                        delay=delay,
+                    )
+        else:
+            # FIX 4: failed — clear pending so we can retry
+            self.pending.discard(rn)
             msg = payload.message
             if "budget exceeded" in msg:
                 print("Budget exceeded — re-run register.py and start over.")
                 self.done = True
-            elif "invalid signature" in msg or "wrong round" in msg:
-                self.submitted.discard(payload.round_number)
+                self.done_event.set()  # FIX 5
+
+    # FIX 3: non-round-1 submitters start when the previous round completes
+    @lazy_wrapper(RoundDonePayload)
+    def on_round_done(self, peer, payload):
+        if peer.public_key.key_to_bin().hex() not in MEMBER_KEYS_HEX:
+            return
+        if payload.rounds_completed + 1 == MY_ROUND:
+            print(f"Round {payload.rounds_completed} done — requesting my challenge (round {MY_ROUND})")
+            self._request_challenge()
+
+    def _teammates(self):
+        return [
+            p for p in self.get_peers()
+            if p.public_key.key_to_bin().hex() in MEMBER_KEYS_HEX
+            and p.public_key.key_to_bin().hex() != self._my_hex
+        ]
 
     def _peer_by_key(self, key_hex):
         for peer in self.get_peers():
@@ -209,8 +286,11 @@ async def main():
     )
     ipv8 = IPv8(builder.finalize(), extra_communities={"Lab2Community": Lab2Community})
     await ipv8.start()
+    community = next(o for o in ipv8.overlays if isinstance(o, Lab2Community))
     print("IPv8 started — discovering peers...")
-    await asyncio.get_event_loop().create_future()
+    # FIX 5: await an Event set by the community instead of stopping the loop from a callback
+    await community.done_event.wait()
+    await ipv8.stop()
 
 
 asyncio.run(main())
