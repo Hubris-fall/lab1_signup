@@ -60,7 +60,7 @@ class Lab1Community(Community):
         print(f"Known peers: {len(peers)}")
         for peer in peers:
             key_hex = peer.public_key.key_to_bin().hex()
-            print(f"  peer key: {key_hex[:20]}...")
+            print(f"  peer key: {key_hex}")
             if key_hex == SERVER_KEY_HEX:
                 if not self.submitted:
                     self.submitted = True
@@ -100,3 +100,4 @@ async def main():
 
 
 asyncio.run(main())
+## 4c69624e61434c504b3a5f466412912c28b51bdb36dceadbf8d13513be72e463662a38832e46b9116a5175133644feb6a13ff83ff863ba434c50b68a2cd950a2ec85b9172a713e57e7f4
