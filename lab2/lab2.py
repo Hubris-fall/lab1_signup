@@ -8,7 +8,7 @@ from ipv8_service import IPv8
 
 # ===================== CONFIGURE THIS PER MEMBER =====================
 MY_ROUND = 2    # Which round YOU submit: 1, 2, or 3
-KEY_FILE  = "../lab1_signup/my_key.pem"
+KEY_FILE  = "../my_key.pem"
 GROUP_ID  = "5b8a6718b3d6edf7"  # Paste the group_id printed by register.py here
 
 # All 3 member public keys in the same canonical order used during registration.
@@ -95,8 +95,7 @@ class Lab2Community(Community):
         self._my_hex = ""
         self._my_idx = -1
 
-    # FIX 1: no _ipv8 parameter — IPv8 calls started() with no args
-    def started(self):
+    def started(self, _ipv8):
         self._my_hex = self.my_peer.public_key.key_to_bin().hex()
         if self._my_hex not in MEMBER_KEYS_HEX:
             raise RuntimeError(f"My key not in MEMBER_KEYS_HEX:\n  {self._my_hex}")
