@@ -139,7 +139,8 @@ class Lab2Community(Community):
         if self.done or self.server_peer is None:
             return
         self.ez_send(self.server_peer, ChallengeRequestPayload(GROUP_ID))
-        # Retry every second in case the request or response is lost
+        # Cancel before re-registering so duplicate calls from on_round_done don't crash
+        self.cancel_pending_task("challenge_retry")
         self.register_task("challenge_retry", self._request_challenge, delay=1.0)
 
     @lazy_wrapper(ChallengeResponsePayload)
@@ -264,29 +265,34 @@ class Lab2Community(Community):
                 self.done_event.set()  # FIX 5
                 return
 
-            # FIX 3: signal next submitter (3 attempts to survive packet loss)
-            next_peer = self._peer_by_key(MEMBER_KEYS_HEX[payload.rounds_completed])
-            if next_peer:
-                for delay in (0.0, 0.2, 0.5):
-                    self.register_anonymous_task(
-                        f"notify_{delay}",
-                        lambda p=next_peer, rc=payload.rounds_completed:
-                            self.ez_send(p, RoundDonePayload(GROUP_ID, rc)),
-                        delay=delay,
-                    )
+            # Notify all members (3 attempts each to survive packet loss)
+            rc = payload.rounds_completed
+            for key in MEMBER_KEYS_HEX:
+                target = self._peer_by_key(key)
+                if target and key != self._my_hex:
+                    for delay in (0.0, 0.2, 0.5):
+                        self.register_anonymous_task(
+                            f"notify_{key[:8]}_{delay}",
+                            lambda p=target, r=rc: self.ez_send(p, RoundDonePayload(GROUP_ID, r)),
+                            delay=delay,
+                        )
         else:
-            # FIX 4: failed — clear pending so we can retry
             self.pending.discard(rn)
             msg = payload.message
             if "budget exceeded" in msg:
                 print("Budget exceeded — re-run register.py and start over.")
                 self.done = True
-                self.done_event.set()  # FIX 5
+                self.done_event.set()
+            else:
+                # Transient failure — retry immediately if we still have all sigs
+                self._try_submit(rn)
 
     # FIX 3: non-round-1 submitters start when the previous round completes
     @lazy_wrapper(RoundDonePayload)
     def on_round_done(self, peer, payload):
         if peer.public_key.key_to_bin().hex() not in MEMBER_KEYS_HEX:
+            return
+        if payload.group_id != GROUP_ID:
             return
         if payload.rounds_completed + 1 == MY_ROUND:
             print(f"Round {payload.rounds_completed} done — requesting my challenge (round {MY_ROUND})")
