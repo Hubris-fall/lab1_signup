@@ -139,8 +139,10 @@ class Lab2Community(Community):
         if self.done or self.server_peer is None:
             return
         self.ez_send(self.server_peer, ChallengeRequestPayload(GROUP_ID))
-        # Cancel before re-registering so duplicate calls from on_round_done don't crash
-        self.cancel_pending_task("challenge_retry")
+        try:
+            self.cancel_pending_task("challenge_retry")
+        except Exception:
+            pass
         self.register_task("challenge_retry", self._request_challenge, delay=1.0)
 
     @lazy_wrapper(ChallengeResponsePayload)
@@ -290,12 +292,19 @@ class Lab2Community(Community):
     # FIX 3: non-round-1 submitters start when the previous round completes
     @lazy_wrapper(RoundDonePayload)
     def on_round_done(self, peer, payload):
-        if peer.public_key.key_to_bin().hex() not in MEMBER_KEYS_HEX:
+        sender_hex = peer.public_key.key_to_bin().hex()
+        if sender_hex not in MEMBER_KEYS_HEX:
             return
         if payload.group_id != GROUP_ID:
             return
-        if payload.rounds_completed + 1 == MY_ROUND:
-            print(f"Round {payload.rounds_completed} done — requesting my challenge (round {MY_ROUND})")
+        rc = int(payload.rounds_completed)
+        if rc < 1 or rc > 2:
+            return
+        if sender_hex != MEMBER_KEYS_HEX[rc - 1]:
+            print(f"Ignoring RoundDone from wrong member")
+            return
+        if rc + 1 == MY_ROUND:
+            print(f"Round {rc} done — requesting my challenge (round {MY_ROUND})")
             self._request_challenge()
 
     def _teammates(self):
