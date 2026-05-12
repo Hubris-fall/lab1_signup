@@ -3,6 +3,7 @@ from ipv8.community import Community
 from ipv8.configuration import ConfigBuilder, Strategy, WalkerDefinition, default_bootstrap_defs
 from ipv8.lazy_community import lazy_wrapper
 from ipv8.messaging.lazy_payload import VariablePayload, vp_compile
+from ipv8.keyvault.crypto import default_eccrypto
 from ipv8_service import IPv8
 
 # ===================== CONFIGURE THIS PER MEMBER =====================
@@ -153,37 +154,57 @@ class Lab2Community(Community):
         self.nonces[rn] = nonce
 
         # FIX 2: use self.crypto.create_signature — safe for any key type
-        my_sig = self.crypto.create_signature(self.my_peer.key, nonce)
+        my_sig = default_eccrypto.create_signature(self.my_peer.key, nonce)
         self.sigs.setdefault(rn, {})[self._my_idx] = my_sig
 
-        # FIX 3: submitter pushes nonce to teammates so they never need to poll
-        for tm in self._teammates():
-            self.ez_send(tm, NonceSharePayload(GROUP_ID, rn, nonce))
+        # Broadcast nonce to teammates; retry twice to survive packet loss
+        self._broadcast_nonce(rn, nonce)
+        for delay in (0.2, 0.5):
+            self.register_anonymous_task(
+                f"rebroadcast_nonce_{rn}_{delay}",
+                lambda r=rn, n=nonce: self._broadcast_nonce(r, n),
+                delay=delay,
+            )
 
         self._try_submit(rn)
+
+    def _broadcast_nonce(self, rn, nonce):
+        if rn in self.submitted or self.done:
+            return
+        for tm in self._teammates():
+            self.ez_send(tm, NonceSharePayload(GROUP_ID, rn, nonce))
+        print(f"[Round {rn}] Broadcast nonce to teammates")
 
     # FIX 3: non-submitters receive the nonce here instead of polling the server
     @lazy_wrapper(NonceSharePayload)
     def on_nonce_share(self, peer, payload):
-        if peer.public_key.key_to_bin().hex() not in MEMBER_KEYS_HEX:
+        sender_hex = peer.public_key.key_to_bin().hex()
+        if sender_hex not in MEMBER_KEYS_HEX:
             return
         rn, nonce = payload.round_number, payload.nonce
-        # FIX 2
-        my_sig = self.crypto.create_signature(self.my_peer.key, nonce)
+        if payload.group_id != GROUP_ID or rn < 1 or rn > 3:
+            return
+        # Validate the nonce came from the expected submitter for this round
+        if sender_hex != MEMBER_KEYS_HEX[rn - 1]:
+            print(f"[Round {rn}] Ignoring nonce from wrong submitter")
+            return
+        my_sig = default_eccrypto.create_signature(self.my_peer.key, nonce)
         submitter_peer = self._peer_by_key(MEMBER_KEYS_HEX[rn - 1])
         if submitter_peer:
             self.ez_send(submitter_peer, SigSharePayload(GROUP_ID, rn, my_sig))
+            print(f"[Round {rn}] Sent my signature to submitter")
 
     @lazy_wrapper(SigSharePayload)
     def on_sig_share(self, peer, payload):
         sender_hex = peer.public_key.key_to_bin().hex()
         if sender_hex not in MEMBER_KEYS_HEX:
             return
+        if payload.group_id != GROUP_ID:
+            return
 
         sender_idx = MEMBER_KEYS_HEX.index(sender_hex)
         rn = payload.round_number
 
-        # FIX 4: also block if already pending (sent but not yet confirmed)
         if rn != MY_ROUND or rn in self.submitted or rn in self.pending:
             return
 
@@ -192,18 +213,34 @@ class Lab2Community(Community):
         self._try_submit(rn)
 
     def _try_submit(self, rn):
-        # FIX 4: pending means we sent a bundle but haven't heard back yet — don't double-send
-        if rn != MY_ROUND or rn in self.submitted or rn in self.pending:
+        if rn != MY_ROUND or rn in self.submitted:
             return
         nonce = self.nonces.get(rn)
         sigs  = self.sigs.get(rn, {})
         if nonce is None or len(sigs) < 3:
             print(f"[Round {rn}] Have {len(sigs)}/3 sigs — waiting")
             return
+        if rn in self.pending:
+            return
 
-        # FIX 4: mark pending now; only promote to submitted after server confirms
         self.pending.add(rn)
         print(f"[Round {rn}] All 3 sigs — submitting bundle!")
+        self._send_bundle(rn)
+        # Retry a few times in case the bundle or server response is lost
+        for delay in (0.2, 0.5, 1.0):
+            self.register_anonymous_task(
+                f"retry_bundle_{rn}_{delay}",
+                lambda r=rn: self._send_bundle(r),
+                delay=delay,
+            )
+
+    def _send_bundle(self, rn):
+        if rn in self.submitted or self.done or self.server_peer is None:
+            return
+        sigs = self.sigs.get(rn, {})
+        if len(sigs) < 3:
+            return
+        print(f"[Round {rn}] Sending bundle")
         self.ez_send(
             self.server_peer,
             SignatureBundlePayload(GROUP_ID, rn, sigs[0], sigs[1], sigs[2]),
