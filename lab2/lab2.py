@@ -269,7 +269,7 @@ class Lab2Community(Community):
                 if target and key != self._my_hex:
                     for delay in (0.0, 0.2, 0.5):
                         self.register_anonymous_task(
-                            f"notify_{key[:8]}_{delay}",
+                            f"notify_{key[-8:]}_{delay}",
                             lambda p=target, r=rc: self.ez_send(p, RoundDonePayload(GROUP_ID, r)),
                             delay=delay,
                         )
@@ -300,14 +300,20 @@ class Lab2Community(Community):
         rc = int(payload.rounds_completed)
         if rc < 1 or rc > 3:
             return
-        if sender_hex != MEMBER_KEYS_HEX[rc - 1]:
+        # For rc==3 accept from any teammate (gossip); for intermediate rounds
+        # only the submitter of that round is authoritative.
+        if rc != 3 and sender_hex != MEMBER_KEYS_HEX[rc - 1]:
             print(f"Ignoring RoundDone from wrong member")
             return
         if rc == 3:
-            # All rounds done — non-submitters learn this here
+            # All rounds done — re-broadcast once so every member terminates
             if not self.done:
                 self.done = True
                 print("All 3 rounds complete!")
+                for key in MEMBER_KEYS_HEX:
+                    target = self._peer_by_key(key)
+                    if target and key != self._my_hex:
+                        self.ez_send(target, RoundDonePayload(GROUP_ID, 3))
                 self.done_event.set()
             return
         if rc + 1 == MY_ROUND and not self.challenge_requested:
