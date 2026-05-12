@@ -7,7 +7,7 @@ from ipv8.keyvault.crypto import default_eccrypto
 from ipv8_service import IPv8
 
 # ===================== CONFIGURE THIS PER MEMBER =====================
-MY_ROUND = 1    # Which round YOU submit: 1, 2, or 3
+MY_ROUND = 2    # Which round YOU submit: 1, 2, or 3
 KEY_FILE  = "../lab1_signup/my_key.pem"
 GROUP_ID  = "5b8a6718b3d6edf7"  # Paste the group_id printed by register.py here
 
@@ -88,8 +88,9 @@ class Lab2Community(Community):
         self.done_event  = asyncio.Event()  # FIX 5
         self.sigs        = {}   # round_number -> {member_idx: sig_bytes}
         self.nonces      = {}   # round_number -> nonce bytes (submitter only)
-        self.pending     = set()   # FIX 4: sent to server, not yet confirmed
-        self.submitted   = set()   # FIX 4: confirmed successful rounds
+        self.pending            = set()  # sent to server, not yet confirmed
+        self.submitted          = set()  # confirmed successful rounds
+        self.challenge_requested = False  # guard against duplicate on_round_done triggers
 
         self._my_hex = ""
         self._my_idx = -1
@@ -261,12 +262,6 @@ class Lab2Community(Community):
             self.pending.discard(rn)
             self.submitted.add(rn)
 
-            if payload.rounds_completed >= 3:
-                self.done = True
-                print("All 3 rounds complete!")
-                self.done_event.set()  # FIX 5
-                return
-
             # Notify all members (3 attempts each to survive packet loss)
             rc = payload.rounds_completed
             for key in MEMBER_KEYS_HEX:
@@ -278,6 +273,11 @@ class Lab2Community(Community):
                             lambda p=target, r=rc: self.ez_send(p, RoundDonePayload(GROUP_ID, r)),
                             delay=delay,
                         )
+
+            if rc >= 3:
+                self.done = True
+                print("All 3 rounds complete!")
+                self.done_event.set()
         else:
             self.pending.discard(rn)
             msg = payload.message
@@ -298,12 +298,20 @@ class Lab2Community(Community):
         if payload.group_id != GROUP_ID:
             return
         rc = int(payload.rounds_completed)
-        if rc < 1 or rc > 2:
+        if rc < 1 or rc > 3:
             return
         if sender_hex != MEMBER_KEYS_HEX[rc - 1]:
             print(f"Ignoring RoundDone from wrong member")
             return
-        if rc + 1 == MY_ROUND:
+        if rc == 3:
+            # All rounds done — non-submitters learn this here
+            if not self.done:
+                self.done = True
+                print("All 3 rounds complete!")
+                self.done_event.set()
+            return
+        if rc + 1 == MY_ROUND and not self.challenge_requested:
+            self.challenge_requested = True
             print(f"Round {rc} done — requesting my challenge (round {MY_ROUND})")
             self._request_challenge()
 
