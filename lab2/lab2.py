@@ -9,7 +9,7 @@ from ipv8_service import IPv8
 # ===================== CONFIGURE THIS PER MEMBER =====================
 MY_ROUND = 2    # Which round YOU submit: 1, 2, or 3
 KEY_FILE  = "../my_key.pem"
-GROUP_ID  = "5b8a6718b3d6edf7"  # Paste the group_id printed by register.py here
+GROUP_ID  = "3f66c2c14924eab2"  # Paste the group_id printed by register.py here
 
 # All 3 member public keys in the same canonical order used during registration.
 # Index 0 = round-1 submitter, 1 = round-2 submitter, 2 = round-3 submitter.
