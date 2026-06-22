@@ -174,9 +174,11 @@ class Lab3BlockchainCommunity(Community):
         self.miner = Miner()
         self.member_keys = []
         self.block_waiters = {}
+        self.height_waiters = {}
         self.request_id = 0
         self.add_message_handler(SubmitTransactionPayload, self.on_submit_transaction)
         self.add_message_handler(GetChainHeightPayload, self.on_get_chain_height)
+        self.add_message_handler(ChainHeightResponsePayload, self.on_chain_height_response)
         self.add_message_handler(GetBlockPayload, self.on_get_block)
         self.add_message_handler(BlockResponsePayload, self.on_block_response)
         self.add_message_handler(PeerTransactionPayload, self.on_peer_transaction)
@@ -192,7 +194,10 @@ class Lab3BlockchainCommunity(Community):
             raise RuntimeError(f"My key is not in MEMBER_KEYS_HEX:\n  {self.local_key.hex()}")
         self.register_anonymous_task(
             "mining_loop",
-            self.miner.mining_loop(self.chain, self.mempool, self),
+            self.miner.mining_loop,
+            self.chain,
+            self.mempool,
+            self,
             ignore=(Exception,),
         )
 
@@ -227,6 +232,19 @@ class Lab3BlockchainCommunity(Community):
             return None
         finally:
             self.block_waiters.pop(key, None)
+
+    async def request_chain_height(self, peer, timeout: float = 3.0):
+        request_id = self.request_id
+        self.request_id += 1
+        future = asyncio.get_running_loop().create_future()
+        self.height_waiters[request_id] = future
+        try:
+            self.ez_send(peer, GetChainHeightPayload(request_id))
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self.height_waiters.pop(request_id, None)
 
     def broadcast_block(self, block: Block, exclude=None):
         payload = block_payload(BlockAnnouncePayload, block)
@@ -266,6 +284,12 @@ class Lab3BlockchainCommunity(Community):
         if block is not None:
             self.send_block_response(peer, block)
 
+    @lazy_wrapper(ChainHeightResponsePayload)
+    def on_chain_height_response(self, _peer, payload):
+        future = self.height_waiters.get(payload.request_id)
+        if future is not None and not future.done():
+            future.set_result(payload.height)
+
     @lazy_wrapper(BlockResponsePayload)
     def on_block_response(self, peer, payload):
         try:
@@ -279,16 +303,16 @@ class Lab3BlockchainCommunity(Community):
             future.set_result(block)
 
     @lazy_wrapper(BlockAnnouncePayload)
-    def on_block_announce(self, peer, payload):
+    async def on_block_announce(self, peer, payload):
         try:
             block = block_from_payload(payload)
         except ValueError as exc:
             LOG.warning("Ignoring malformed block from %s: %s", peer.address, exc)
             return
-        self.apply_received_block(peer, block, rebroadcast=True)
+        await self.apply_received_block(peer, block, rebroadcast=True)
 
-    def apply_received_block(self, peer, block: Block, rebroadcast: bool):
-        accepted = self.miner.on_block_received(self.chain, block, peer, self.mempool, self)
+    async def apply_received_block(self, peer, block: Block, rebroadcast: bool):
+        accepted = await self.miner.on_block_received(self.chain, block, peer, self.mempool, self)
         if accepted and rebroadcast:
             self.broadcast_block(block, exclude=peer)
 

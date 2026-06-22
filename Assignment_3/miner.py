@@ -8,6 +8,7 @@ class Miner:
 
     def __init__(self):
         self._task = None
+        self.catching_up = False
 
     async def mine_one(self, chain: Chain, mempool: Mempool):
         """
@@ -27,7 +28,7 @@ class Miner:
         # mine in a event loop to make it non blocking
         loop = asyncio.get_running_loop()
         try:
-            block = await loop.run_in_executor(None, mine_block, block_height + 1, tip_block.hash, tx_hash_list, DEFAULT_DIFFICULTY)
+            block = await loop.run_in_executor(None, mine_block, block_height + 1, tip_block.hash, tx_hash_list, chain)
         except asyncio.CancelledError:
             logger.info("mining cancelled at height %d (new tip arrived)", block_height + 1)
             raise  # let mining_loop handle the restart
@@ -56,6 +57,9 @@ class Miner:
         """
         while True:
             try:
+                if self.catching_up:
+                    await asyncio.sleep(0.05)
+                    continue
                 self._task = asyncio.ensure_future(self.mine_one(chain, mempool))
                 block = await self._task
                 if block is not None:
@@ -68,7 +72,7 @@ class Miner:
         if self._task and not self._task.done():
             self._task.cancel()
 
-    def on_block_received(self, chain, block, peer, mempool, community):
+    async def on_block_received(self, chain:Chain, block:Block, peer, mempool, community):
         """
         Called by message handler when a BlockAnnounce arrives from a peer.
         Validates and appends the block to the chain. If the chain grew, restarts mining
@@ -83,9 +87,18 @@ class Miner:
                     mempool.remove_confirmed(block.tx_hashes)
                     logger.info(f"Chain grew to {chain.height}, restarting mining")
                     self.restart_mining()
+                return True
             elif "prev_hash unknown" in result[1]:
+                if self.catching_up:
+                    return True
+                self.catching_up = True
+                self.restart_mining()
                 logger.info(f"Orphan block at height {block.height}, need catch-up")
-                asyncio.ensure_future(self.catch_up(chain, peer, block.height, block, community, mempool))
+                try:
+                    await self.catch_up(chain, peer, block.height, block, community, mempool)
+                finally:
+                    self.catching_up = False
+                return True
             else:
                 logger.warning(f"Failed to append block {block.height}")
                 return None
@@ -114,41 +127,58 @@ class Miner:
                     old_confirmed.extend(old_block.tx_hashes)
         return old_confirmed
 
+    async def query_peer_height(self, peer, community):
+        return await community.request_chain_height(peer)
+
     async def catch_up(self, chain, peer, target_height, block, community, mempool=None):
         """
-        Fetch missing blocks from a peer to catch up to target_height.
-        Requests each missing height one by one and waits for handler
-        to apply the received block. Aborts if a height is not received within 1 second.
+        Phase 1: backward walk from the orphan to find the fork point, then replace_suffix.
+        Phase 2: forward walk — query peer height and fetch any blocks still ahead.
         """
+        # Phase 1: backward walk to resolve the fork
         suffix = [block]
-        for h in range(target_height, 0, -1):
-            # send RequestBlock message to peer asking for height h
+        for h in range(target_height - 1, 0, -1):
             logger.info(f"Requesting block at height {h} from peer")
-            block = await self.request_block(peer, h, community)
-            if block is None:
-                logger.warning(f"Timed out waiting for block at height {h}, aborting catch-up")
+            fetched = await self.request_block(peer, h, community)
+            if fetched is None:
+                logger.warning(f"Timed out at height {h}, aborting catch-up")
                 return
-            if chain.get_by_hash(block.prev_hash) is not None:
+            suffix.append(fetched)
+            if chain.get_by_hash(fetched.prev_hash) is not None:
                 break
-            suffix.append(block)
         else:
             logger.warning("Reached genesis during catch-up without connecting to local chain")
             return
 
         suffix.reverse()
-
         old_confirmed = self.get_transacitons_from_previous_suffix(chain, suffix)
-
         ok, reason = chain.replace_suffix(suffix)
+        if not ok:
+            logger.warning(f"Suffix rejected: {reason}")
+            return
+        if mempool is not None:
+            mempool.readd_unconfirmed(old_confirmed)
+            confirmed = [tx_hash for b in suffix for tx_hash in b.tx_hashes]
+            mempool.remove_confirmed(confirmed)
+        logger.info(f"Replaced suffix, chain now at height {chain.height}")
 
-        if ok:
-            if mempool is not None:
-                mempool.readd_unconfirmed(old_confirmed)
-                confirmed = [tx_hash for suffix_block in suffix for tx_hash in suffix_block.tx_hashes]
-                mempool.remove_confirmed(confirmed)
-            logger.info(f"Replaced local suffix with peer suffix at height {chain.height}")
-            self.restart_mining()
-        else:
-            logger.warning(f"Fetched suffix rejected: {reason}")
+        # Phase 2: forward walk until peer is no longer ahead
+        while True:
+            peer_height = await self.query_peer_height(peer, community)
+            if peer_height is None or peer_height <= chain.height:
+                break
+            logger.info(f"Peer at {peer_height}, fetching forward from {chain.height + 1}")
+            for h in range(chain.height + 1, peer_height + 1):
+                fetched = await self.request_block(peer, h, community)
+                if fetched is None:
+                    logger.warning(f"Timed out at height {h}, stopping forward catch-up")
+                    break
+                ok, reason = chain.try_append(fetched)
+                if not ok:
+                    logger.warning(f"Block {h} rejected during forward catch-up: {reason}")
+                    break
+                if mempool is not None:
+                    mempool.remove_confirmed(fetched.tx_hashes)
 
+        self.restart_mining()
         logger.info(f"Catch-up done, chain at height {chain.height}")
