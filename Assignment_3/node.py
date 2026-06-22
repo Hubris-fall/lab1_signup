@@ -25,9 +25,9 @@ SERVER_KEY = bytes.fromhex(
     "4c69624e61434c504b3ae3fc099fb56ca3b5e1de9a1c843387f2acdbb78b1bd4350ffde518068a0d246344b10d0d8c355fd0d76873e7d7f7838f3715e025af08f791324495e083331ce6"
 )
 MEMBER_KEYS_HEX = [
-    "4c69624e61434c504b3ace00d54dc531c779ea9033c3ed9b81c5cf1dced8e16bb70efa91b195d119f07f7a48aea4e7285e9a8c4b3f14e8cf3ada17a5cd43c69e9479eccdc69c36655a42",
-    "4c69624e61434c504b3a5f466412912c28b51bdb36dceadbf8d13513be72e463662a38832e46b9116a5175133644feb6a13ff83ff863ba434c50b68a2cd950a2ec85b9172a713e57e7f4",
-    "4c69624e61434c504b3a2a607508759bbf8873496aae443013b136fdcd3e19f5a7ddb2b148df53b75e441cf7c024b1e84d9016e0a697dbe05dd307ab9e7ee1543464fdac2d7bb493ce88",
+    "4c69624e61434c504b3a138f4426bd0f99a0c2d229d6f2e9a89708a858ea098d3dcc31c5aab8b6012a1f68e81c6b8362278afaea96cf1fd469f2186000ecd10ef83dcc2bb8004b3c2fe3",  # member 1 (round-1 submitter)
+    "4c69624e61434c504b3a5f466412912c28b51bdb36dceadbf8d13513be72e463662a38832e46b9116a5175133644feb6a13ff83ff863ba434c50b68a2cd950a2ec85b9172a713e57e7f4",  # member 2 (round-2 submitter)
+    "4c69624e61434c504b3a2a607508759bbf8873496aae443013b136fdcd3e19f5a7ddb2b148df53b75e441cf7c024b1e84d9016e0a697dbe05dd307ab9e7ee1543464fdac2d7bb493ce88",  # member 3 (round-3 submitter)
 ]
 
 LOG = logging.getLogger("lab3")
@@ -188,16 +188,15 @@ class Lab3BlockchainCommunity(Community):
     def local_key(self) -> bytes:
         return self.my_peer.public_key.key_to_bin()
 
-    def configure(self, member_keys: list[bytes]):
+    def configure(self, member_keys: list[bytes], mining_delay: float = 0.0, timestamp_lie=None):
         self.member_keys = member_keys
+        self.miner.delay = mining_delay
+        self.miner.timestamp_lie = timestamp_lie
         if self.local_key not in self.member_keys:
             raise RuntimeError(f"My key is not in MEMBER_KEYS_HEX:\n  {self.local_key.hex()}")
         self.register_anonymous_task(
             "mining_loop",
-            self.miner.mining_loop,
-            self.chain,
-            self.mempool,
-            self,
+            self.mine_after_teammates_connect,
             ignore=(Exception,),
         )
 
@@ -208,6 +207,21 @@ class Lab3BlockchainCommunity(Community):
             if p.public_key.key_to_bin() in self.member_keys
             and p.public_key.key_to_bin() not in (self.local_key, exclude_key)
         ]
+
+    async def mine_after_teammates_connect(self):
+        expected = set(self.member_keys) - {self.local_key}
+        last_missing = None
+        while True:
+            connected = {peer.public_key.key_to_bin() for peer in self.teammates()}
+            missing = expected - connected
+            if not missing:
+                break
+            if missing != last_missing:
+                LOG.info("Waiting for teammate keys: %s", ", ".join(key.hex() for key in sorted(missing)))
+                last_missing = missing
+            await asyncio.sleep(1)
+        LOG.info("All %d teammates connected; starting mining", len(expected))
+        await self.miner.mining_loop(self.chain, self.mempool, self)
 
     def send_submit_response(self, peer, success: bool, txh: bytes, message: str):
         self.ez_send(peer, SubmitTransactionResponsePayload(success, txh, message))
@@ -309,9 +323,12 @@ class Lab3BlockchainCommunity(Community):
         except ValueError as exc:
             LOG.warning("Ignoring malformed block from %s: %s", peer.address, exc)
             return
+        print(f"Received block {block.height} from {peer.address}: timestamp={block.timestamp}")
         await self.apply_received_block(peer, block, rebroadcast=True)
 
     async def apply_received_block(self, peer, block: Block, rebroadcast: bool):
+        if block.hash in self.chain._by_hash:
+            return
         accepted = await self.miner.on_block_received(self.chain, block, peer, self.mempool, self)
         if accepted and rebroadcast:
             self.broadcast_block(block, exclude=peer)
@@ -364,8 +381,15 @@ def parse_args():
     parser.add_argument("--member-key", action="append", type=parse_hex, default=None)
     parser.add_argument("--no-register", action="store_true")
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--mining-delay", type=float, default=0.0,
+                        help="seconds to wait before each mining attempt")
+    parser.add_argument("--lie", choices=["forward", "backward"],
+                        help="mine using a dishonest timestamp")
     parser.add_argument("--log-level", default="INFO", choices=["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"])
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.mining_delay < 0:
+        parser.error("--mining-delay must be non-negative")
+    return args
 
 
 def build_ipv8(args) -> IPv8:
@@ -396,7 +420,7 @@ async def async_main():
     reg_community = next(o for o in ipv8.overlays if isinstance(o, Lab3RegistrationCommunity))
     chain_community = next(o for o in ipv8.overlays if isinstance(o, Lab3BlockchainCommunity))
     try:
-        chain_community.configure(member_keys)
+        chain_community.configure(member_keys, args.mining_delay, args.lie)
         print(f"local_public_key={chain_community.local_key.hex()}")
         print(f"blockchain_community_id={chain_community.community_id.hex()}")
         if not args.no_register:

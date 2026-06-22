@@ -1,14 +1,17 @@
-import asyncio, logging
-from blockchain import mine_block, Block, Chain, DEFAULT_DIFFICULTY
+import asyncio, logging, time
+from blockchain import mine_block, Block, Chain, DEFAULT_DIFFICULTY, FUTURE_TIME_LIMIT, median_time_past
 from mempool import Mempool
 
 logger = logging.getLogger(__name__)
 
 class Miner:
 
-    def __init__(self):
+    def __init__(self, delay=0.0, timestamp_lie=None):
         self._task = None
         self.catching_up = False
+        self.delay = delay
+        self.timestamp_lie = timestamp_lie
+        self._catch_result = None  # [block] holder shared with mining thread during catch-up
 
     async def mine_one(self, chain: Chain, mempool: Mempool):
         """
@@ -20,6 +23,9 @@ class Miner:
         """
         # get tip of chain, height and pending transactions to mine
 
+        if self.delay:
+            await asyncio.sleep(self.delay)
+
         tip_block = chain.tip
         block_height = tip_block.height
         pending_txs = mempool.drain() #gives a list of (hash, tx) tuples
@@ -27,14 +33,23 @@ class Miner:
 
         # mine in a event loop to make it non blocking
         loop = asyncio.get_running_loop()
+        result_holder = [None]  # shared list so the thread can write its result after cancel
+
+        def mine_and_save():
+            b = mine_block(block_height + 1, tip_block.hash, tx_hash_list, chain, 0, self.timestamp_lie)
+            result_holder[0] = b
+            return b
+
         try:
-            block = await loop.run_in_executor(None, mine_block, block_height + 1, tip_block.hash, tx_hash_list, chain)
+            block = await loop.run_in_executor(None, mine_and_save)
         except asyncio.CancelledError:
             logger.info("mining cancelled at height %d (new tip arrived)", block_height + 1)
+            if self.catching_up:
+                self._catch_result = result_holder  # thread may still write here
             raise  # let mining_loop handle the restart
 
         try:
-            result = chain.try_append(block)
+            result = chain.try_append(block, validate_timestamp=self.timestamp_lie is None)
         except Exception as e:
             logger.error("unexpected error appending block %d: %s", block_height + 1, e)
             return None
@@ -72,6 +87,23 @@ class Miner:
         if self._task and not self._task.done():
             self._task.cancel()
 
+    def _try_recover_mined_block(self, chain, mempool, community):
+        """If the mining thread finished during catch-up and the block still fits the tip, use it."""
+        holder = self._catch_result
+        self._catch_result = None
+        if holder is None:
+            return
+        mined = holder[0]  # None if the thread hasn't finished yet
+        if mined is None or mined.prev_hash != chain.tip.hash:
+            return
+        ok, reason = chain.try_append(mined, validate_timestamp=self.timestamp_lie is None)
+        if ok:
+            mempool.remove_confirmed(mined.tx_hashes)
+            self.broadcast_block(community, mined)
+            logger.info("recovered block %d mined during catch-up", mined.height)
+        else:
+            logger.debug("mined block from catch-up no longer valid: %s", reason)
+
     async def on_block_received(self, chain:Chain, block:Block, peer, mempool, community):
         """
         Called by message handler when a BlockAnnounce arrives from a peer.
@@ -80,6 +112,15 @@ class Miner:
         the missing blocks from the peer.
         """
         try:
+            if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+                logger.warning("Rejecting block %d: timestamp too far in the future", block.height)
+                return None
+            parent = chain.get_by_hash(block.prev_hash)
+            if parent is not None:
+                mtp = median_time_past(parent, chain._by_hash)
+                if block.timestamp <= mtp:
+                    logger.warning("Rejecting block %d: timestamp %d <= parent MTP %d", block.height, block.timestamp, mtp)
+                    return None
             prev_height = chain.height
             result = chain.try_append(block)
             if result[0]:
@@ -91,6 +132,9 @@ class Miner:
             elif "prev_hash unknown" in result[1]:
                 if self.catching_up:
                     return True
+                if block.height <= chain.height:
+                    logger.info(f"Stale orphan at height {block.height} (chain at {chain.height}), ignoring")
+                    return None
                 self.catching_up = True
                 self.restart_mining()
                 logger.info(f"Orphan block at height {block.height}, need catch-up")
@@ -98,7 +142,8 @@ class Miner:
                     await self.catch_up(chain, peer, block.height, block, community, mempool)
                 finally:
                     self.catching_up = False
-                return True
+                self._try_recover_mined_block(chain, mempool, community)
+                return chain.get_by_hash(block.hash) is not None
             else:
                 logger.warning(f"Failed to append block {block.height}")
                 return None
@@ -136,12 +181,18 @@ class Miner:
         Phase 2: forward walk — query peer height and fetch any blocks still ahead.
         """
         # Phase 1: backward walk to resolve the fork
+        if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+            logger.warning("Rejecting block %d: timestamp too far in the future", block.height)
+            return
         suffix = [block]
         for h in range(target_height - 1, 0, -1):
             logger.info(f"Requesting block at height {h} from peer")
             fetched = await self.request_block(peer, h, community)
             if fetched is None:
                 logger.warning(f"Timed out at height {h}, aborting catch-up")
+                return
+            if fetched.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+                logger.warning("Rejecting block %d: timestamp too far in the future", fetched.height)
                 return
             suffix.append(fetched)
             if chain.get_by_hash(fetched.prev_hash) is not None:

@@ -14,7 +14,7 @@ BLOCKCHAIN_COMMUNITY_ID: bytes = b"Lab3_3f66c2c14924eab"
 assert len(BLOCKCHAIN_COMMUNITY_ID) == 20
 
 # Leading zero bits every mined block must satisfy
-DEFAULT_DIFFICULTY: int = 12
+DEFAULT_DIFFICULTY: int = 19
 
 # Timestamp derived from group ID: int("3f66c2c14924eab2", 16) % 10**9 = 425579698
 GENESIS_TIMESTAMP: int = 425579698
@@ -216,6 +216,7 @@ def mine_block(
     tx_hash_list: List[bytes],
     chain: Chain,
     start_nonce: int = 0,
+    timestamp_lie: Optional[str] = None,
 ) -> Block:
     """Search for a nonce that satisfies `difficulty` leading zero bits."""
     tip = chain.tip
@@ -223,6 +224,10 @@ def mine_block(
     difficulty = chain.compute_next_difficulty()
     mtp_floor  = median_time_past(tip, chain._by_hash) + 1
     timestamp  = max(int(time.time()), mtp_floor)
+    if timestamp_lie == "forward":
+        timestamp += FUTURE_TIME_LIMIT * 2
+    elif timestamp_lie == "backward":
+        timestamp = mtp_floor - FUTURE_TIME_LIMIT * 2
     nonce = start_nonce
 
     print(f"Mining block at height {height} with difficulty {difficulty} ...")
@@ -327,7 +332,7 @@ class Chain:
         """Return the canonical block at height h (walks back from tip)."""
         return self._canonical_at(h)
 
-    def try_append(self, block: Block) -> tuple[bool, str]:
+    def try_append(self, block: Block, validate_timestamp: bool = True) -> tuple[bool, str]:
         """Validate and store a block. Returns (True, "") on success."""
         if block.hash in self._by_hash:
             return True, "already known"
@@ -348,11 +353,12 @@ class Chain:
         if block.height != parent.height + 1:
             return False, f"height {block.height} does not follow parent {parent.height}"
 
-        parent_mtp = median_time_past(parent, self._by_hash)
-        if block.timestamp <= parent_mtp:
-            return False, f"timestamp {block.timestamp} <= parent MTP {parent_mtp}"
-        if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
-            return False, f"timestamp {block.timestamp} more than {FUTURE_TIME_LIMIT}s in the future"
+        if validate_timestamp:
+            parent_mtp = median_time_past(parent, self._by_hash)
+            if block.timestamp <= parent_mtp:
+                return False, f"timestamp {block.timestamp} <= parent MTP {parent_mtp}"
+            if block.timestamp > int(time.time()) + FUTURE_TIME_LIMIT:
+                return False, f"timestamp {block.timestamp} more than {FUTURE_TIME_LIMIT}s in the future"
 
         difficulty = self.compute_next_difficulty(parent)
         if block.difficulty != difficulty:
@@ -469,10 +475,14 @@ class Chain:
             blocks.append(cursor)
         blocks.reverse()
 
-        solvetimes = [
-            max(1, min(blocks[i].timestamp - blocks[i - 1].timestamp, 6 * T))
-            for i in range(1, len(blocks))
-        ]
+        solvetimes = []
+        for i in range(1, len(blocks)):
+            raw = blocks[i].timestamp - blocks[i - 1].timestamp
+            clamped = max(1, min(raw, 6 * T))
+            if raw != clamped:
+                print(f"Timestamp delta clamped: {blocks[i - 1].timestamp} -> "
+                      f"{blocks[i].timestamp} ({raw}s -> {clamped}s)")
+            solvetimes.append(clamped)
 
         slow = sum(1 for s in solvetimes if s > T * DEAD_BAND_FACTOR)
         fast = sum(1 for s in solvetimes if s < T / DEAD_BAND_FACTOR)
